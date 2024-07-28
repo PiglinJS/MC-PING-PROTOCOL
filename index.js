@@ -1,7 +1,7 @@
 const net = require('net');
 const dns = require('dns');
 
-const host = 'mc.hypixel.net';
+const host = 'serverip';
 const defaultPort = 25565;
 
 function createVarInt(value) {
