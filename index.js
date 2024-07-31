@@ -24,7 +24,8 @@ SOFTWARE.
 const net = require('net');
 const dns = require('dns');
 
-const host = 'serverip';
+// Configuration
+const serverAddress = 'serverip:port';
 const defaultPort = 25565;
 
 function createVarInt(value) {
@@ -45,88 +46,116 @@ function createPacket(id, data) {
   return Buffer.concat([lengthBuffer, idBuffer, data]);
 }
 
-let buffer = Buffer.alloc(0);
+function readVarInt(buffer, offset) {
+  let value = 0;
+  let size = 0;
+  let byte;
+  do {
+    byte = buffer[offset++];
+    value |= (byte & 0x7f) << (size++ * 7);
+    if (size > 5) {
+      throw new Error('VarInt is too big');
+    }
+  } while (byte & 0x80);
+  return [value, offset];
+}
 
 function connectToServer(host, port) {
-  const client = new net.Socket();
+  return new Promise((resolve, reject) => {
+    const client = new net.Socket();
+    let buffer = Buffer.alloc(0);
+    let serverInfo;
+    let pingStartTime;
 
-  client.connect(port, host, () => {
-    console.log(`Connected to ${host}:${port}`);
+    client.connect(port, host, () => {
+      console.log(`Connected to ${host}:${port}`);
+      const hostBuffer = Buffer.from(host, 'utf8');
+      const portBuffer = Buffer.alloc(2);
+      portBuffer.writeUInt16BE(port, 0);
+      const handshakeData = Buffer.concat([
+        createVarInt(47),
+        createVarInt(hostBuffer.length),
+        hostBuffer,
+        portBuffer,
+        createVarInt(1)
+      ]);
+      const handshakePacket = createPacket(0x00, handshakeData);
+      client.write(handshakePacket);
+      const statusRequestPacket = createPacket(0x00, Buffer.alloc(0));
+      client.write(statusRequestPacket);
+    });
 
-    const hostBuffer = Buffer.from(host, 'utf8');
-    const portBuffer = Buffer.alloc(2);
-    portBuffer.writeUInt16BE(port, 0);
-    const handshakeData = Buffer.concat([
-      createVarInt(47),
-      createVarInt(hostBuffer.length),
-      hostBuffer,
-      portBuffer,
-      createVarInt(1)
-    ]);
-    const handshakePacket = createPacket(0x00, handshakeData);
-    client.write(handshakePacket);
-
-    const statusRequestPacket = createPacket(0x00, Buffer.alloc(0));
-    client.write(statusRequestPacket);
-  });
-
-  client.on('data', (data) => {
-    buffer = Buffer.concat([buffer, data]);
-
-    let offset = 0;
-
-    function readVarInt() {
-      let value = 0;
-      let size = 0;
-      let byte;
-      do {
-        byte = buffer[offset++];
-        value |= (byte & 0x7f) << (size++ * 7);
-        if (size > 5) {
-          throw new Error('VarInt is too big');
+    client.on('data', (data) => {
+      buffer = Buffer.concat([buffer, data]);
+      try {
+        let offset = 0;
+        let [length, newOffset] = readVarInt(buffer, offset);
+        offset = newOffset;
+        if (buffer.length >= offset + length) {
+          let [packetId, newOffset] = readVarInt(buffer, offset);
+          offset = newOffset;
+          if (packetId === 0x00) {
+            let [jsonLength, newOffset] = readVarInt(buffer, offset);
+            offset = newOffset;
+            const jsonResponse = buffer.slice(offset, offset + jsonLength).toString('utf8');
+            serverInfo = JSON.parse(jsonResponse);
+            // Send ping packet
+            const pingPacket = createPacket(0x01, Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]));
+            pingStartTime = process.hrtime.bigint();
+            client.write(pingPacket);
+            buffer = buffer.slice(offset + jsonLength);
+          } else if (packetId === 0x01) {
+            const latency = Number(process.hrtime.bigint() - pingStartTime) / 1e6;
+            serverInfo.latency = Math.round(latency);
+            resolve(serverInfo);
+            client.destroy();
+          }
         }
-      } while (byte & 0x80);
-      return value;
-    }
-
-    try {
-      const length = readVarInt();
-
-      if (buffer.length >= offset + length) {
-        const packetId = readVarInt();
-
-        if (packetId === 0x00) {
-          const jsonLength = readVarInt();
-          const jsonResponse = buffer.toString('utf8', offset, offset + jsonLength);
-          const serverInfo = JSON.parse(jsonResponse);
-          console.log('Server Info:', JSON.stringify(serverInfo, null, 2));
-          client.destroy();
-        }
+      } catch (e) {
+        reject(e);
       }
-    } catch (e) {
-      console.error('Error parsing packet:', e);
-    }
-  });
+    });
 
-  client.on('error', (err) => {
-    console.error('Error:', err);
-  });
+    client.on('error', (err) => {
+      reject(err);
+    });
 
-  client.on('close', () => {
-    console.log('Connection closed');
+    client.on('close', () => {
+      console.log('Connection closed');
+    });
   });
 }
 
-dns.resolveSrv(`_minecraft._tcp.${host}`, (err, addresses) => {
-  if (err) {
-    console.error('Failed to resolve SRV records:', err);
-    connectToServer(host, defaultPort);
-  } else if (addresses.length > 0) {
-    const address = addresses[0];
-    console.log(`Resolved SRV: ${address.name}:${address.port}`);
-    connectToServer(address.name, address.port);
-  } else {
-    console.error('No SRV records found');
-    connectToServer(host, defaultPort);
-  }
-});
+function parseHostAndPort(input) {
+  const [host, port] = input.split(':');
+  return {
+    host: host,
+    port: port ? parseInt(port, 10) : defaultPort
+  };
+}
+
+function pingServer(input) {
+  const { host, port } = parseHostAndPort(input);
+
+  return new Promise((resolve, reject) => {
+    dns.resolveSrv(`_minecraft._tcp.${host}`, (err, addresses) => {
+      if (err || addresses.length === 0) {
+        console.log(`Using host: ${host} and port: ${port}`);
+        connectToServer(host, port).then(resolve).catch(reject);
+      } else {
+        const address = addresses[0];
+        console.log(`Resolved SRV: ${address.name}:${address.port}`);
+        connectToServer(address.name, address.port).then(resolve).catch(reject);
+      }
+    });
+  });
+}
+
+// Usage
+pingServer(serverAddress)
+  .then(serverInfo => {
+    console.log('Server Info:', JSON.stringify(serverInfo, null, 2));
+  })
+  .catch(error => {
+    console.error('Error:', error);
+  });
