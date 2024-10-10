@@ -73,7 +73,7 @@ function connectToServer(host, port) {
       const portBuffer = Buffer.alloc(2);
       portBuffer.writeUInt16BE(port, 0);
       const handshakeData = Buffer.concat([
-        createVarInt(47),
+        createVarInt(-1),
         createVarInt(hostBuffer.length),
         hostBuffer,
         portBuffer,
